@@ -1,0 +1,363 @@
+#!/usr/bin/env python3
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy import stats
+import statsmodels.api as sm
+from statsmodels.graphics.gofplots import qqplot
+from sklearn.linear_model import LassoCV
+from statsmodels.stats.outliers_influence import variance_inflation_factor
+
+# -------------------------------
+# Data Loading and Preprocessing
+# -------------------------------
+
+def load_and_clean_data(filename):
+    """
+    Load the data from a CSV file and perform initial cleaning.
+    """
+    # Load the data
+    data = pd.read_csv(filename)
+    
+    # Rename columns for consistency and ease of use
+    data.columns = [
+        'Residency_Rank', 'Program', 'Resident', 'Medical_School_Rank', 'Medical_School',
+        'Unused_Column', 'IS_or_OOS', 'Pub_Journal', 'Pub_Journal_APC', 'Pub_Journal_IF',
+        'Pub_Journal_Pub_Model'
+    ]
+    
+    # Drop the unused column if necessary
+    data = data.drop(columns=['Unused_Column'])
+    
+    # Clean APC and Impact Factor columns
+    data['Pub_Journal_APC'] = data['Pub_Journal_APC'].replace({'\$': '', ',': '', ' ': ''}, regex=True).astype(float)
+    data['Pub_Journal_IF'] = pd.to_numeric(data['Pub_Journal_IF'], errors='coerce')
+    
+    # Clean Medical School Rank
+    data['Medical_School_Rank'] = data['Medical_School_Rank'].replace({'NR': np.nan})
+    data['Medical_School_Rank'] = pd.to_numeric(data['Medical_School_Rank'], errors='coerce')
+    
+    # Impute missing Medical School Ranks with median rank
+    median_rank = data['Medical_School_Rank'].median()
+    data['Medical_School_Rank'] = data['Medical_School_Rank'].fillna(median_rank)
+    
+    # Standardize IS_or_OOS column
+    data['IS_or_OOS'] = data['IS_or_OOS'].str.strip().str.lower()
+    data['IS_or_OOS'] = data['IS_or_OOS'].map({'yes': 1, 'no': 0})
+    
+    # Handle missing data
+    data = data.dropna(subset=['Pub_Journal_APC', 'Pub_Journal_IF', 'IS_or_OOS'])
+    
+    # Extract Resident ID
+    data['Resident_ID'] = data['Resident'].astype('category').cat.codes
+    
+    # Correct Publishing Model typos
+    data['Pub_Journal_Pub_Model'] = data['Pub_Journal_Pub_Model'].str.strip().replace({'Hyrbid': 'Hybrid', 'hybrid': 'Hybrid'})
+    
+    return data
+
+# -------------------------------
+# Statistical Analysis Functions
+# -------------------------------
+
+def descriptive_statistics(data):
+    """
+    Compute and display descriptive statistics.
+    """
+    print("=== Descriptive Statistics ===\n")
+    
+    # Journal-level statistics
+    journals = data[['Pub_Journal', 'Pub_Journal_APC', 'Pub_Journal_IF', 'Pub_Journal_Pub_Model']].drop_duplicates()
+    journals = journals.rename(columns={
+        'Pub_Journal': 'Journal_Name',
+        'Pub_Journal_APC': 'APC',
+        'Pub_Journal_IF': 'Impact_Factor',
+        'Pub_Journal_Pub_Model': 'Publishing_Model'
+    })
+    
+    print("Journal Metrics:")
+    print(journals[['APC', 'Impact_Factor']].describe())
+    
+    print("\nPublishing Model Counts:")
+    print(journals['Publishing_Model'].value_counts())
+    
+    # Save journal descriptive statistics to CSV
+    journals[['APC', 'Impact_Factor']].describe().to_csv('journal_descriptive_statistics.csv')
+    
+    # Resident-level statistics
+    residents = data.groupby('Resident_ID').agg({
+        'Pub_Journal': 'count',  # Counts the number of publications per resident
+        'Pub_Journal_APC': 'mean',
+        'Pub_Journal_IF': 'mean',
+        'Medical_School_Rank': 'first'
+    }).rename(columns={
+        'Pub_Journal': 'Num_Publications',
+        'Pub_Journal_APC': 'Avg_APC',
+        'Pub_Journal_IF': 'Avg_IF'
+    })
+    
+    print("\nResident Metrics:")
+    print(residents.describe())
+    
+    # Save resident descriptive statistics to CSV
+    residents.describe().to_csv('resident_descriptive_statistics.csv')
+    
+    return journals, residents
+
+def correlation_analysis(journals):
+    """
+    Perform correlation analyses.
+    """
+    print("\n=== Correlation Analyses ===\n")
+    
+    # H1: Impact Factor vs. APC
+    corr_h1, p_h1 = stats.spearmanr(journals['Impact_Factor'], journals['APC'])
+    print(f"H1 - Impact Factor vs. APC: Spearman correlation={corr_h1:.4f}, p-value={p_h1:.4f}")
+    
+    # Define APC categories using quantiles
+    apc_values = journals['APC'].dropna()
+    apc_quantiles = apc_values.quantile([0.33, 0.66]).tolist()
+    apc_bins = [apc_values.min() - 1] + apc_quantiles + [apc_values.max()]
+    apc_labels = ['Low', 'Medium', 'High']
+    journals['APC_Category'] = pd.cut(journals['APC'], bins=apc_bins, labels=apc_labels, include_lowest=True)
+    
+    # Define IF categories using quantiles
+    if_values = journals['Impact_Factor'].dropna()
+    if_quantiles = if_values.quantile([0.33, 0.66]).tolist()
+    if_bins = [if_values.min() - 1] + if_quantiles + [if_values.max()]
+    if_labels = ['Low', 'Medium', 'High']
+    journals['IF_Category'] = pd.cut(journals['Impact_Factor'], bins=if_bins, labels=if_labels, include_lowest=True)
+    
+    # H4: IF Category vs. Publishing Model
+    contingency_table = pd.crosstab(journals['IF_Category'], journals['Publishing_Model'])
+    chi2, p, dof, expected = stats.chi2_contingency(contingency_table)
+    print(f"\nH4 - Chi-Square Test for IF Category vs. Publishing Model: Chi2={chi2:.4f}, p-value={p:.4f}")
+    
+    # Save contingency table to CSV
+    contingency_table.to_csv('if_category_vs_publishing_model.csv')
+    
+    # H10: APC Category vs. Publishing Model
+    contingency_table_apc = pd.crosstab(journals['APC_Category'], journals['Publishing_Model'])
+    chi2_apc, p_apc, dof_apc, expected_apc = stats.chi2_contingency(contingency_table_apc)
+    print(f"\nH10 - Chi-Square Test for APC Category vs. Publishing Model: Chi2={chi2_apc:.4f}, p-value={p_apc:.4f}")
+    
+    # Save contingency table to CSV
+    contingency_table_apc.to_csv('apc_category_vs_publishing_model.csv')
+    
+    # Return journals dataframe with new categories
+    return journals
+
+def regression_analysis(residents):
+    """
+    Perform regression analysis to identify significant predictors.
+    """
+    print("\n=== Regression Analysis ===\n")
+    
+    # Prepare the data
+    residents = residents.dropna()
+    X = residents[['Avg_APC', 'Avg_IF', 'Medical_School_Rank']]
+    y = residents['Num_Publications']
+    
+    # Transform the dependent variable
+    # y_transformed = np.log1p(y)  # Uncomment if transformation is needed
+    
+    # Standardize variables
+    X_scaled = (X - X.mean()) / X.std()
+    
+    # Check if X_scaled is empty
+    if X_scaled.empty:
+        print("Error: Feature matrix X is empty after scaling. Check data preprocessing.")
+        return None, None, None
+    
+    # LASSO Regression to select significant predictors
+    lasso = LassoCV(cv=5, random_state=0).fit(X_scaled, y)
+    coef = pd.Series(lasso.coef_, index=X.columns)
+    print("LASSO selected features and their coefficients:")
+    print(coef)
+    
+    # Select predictors with non-zero coefficients
+    significant_predictors = coef[coef != 0].index.tolist()
+    print(f"\nSignificant Predictors after LASSO: {significant_predictors}")
+    
+    if not significant_predictors:
+        print("No significant predictors were found by LASSO.")
+        return None, None, None
+    
+    # Prepare data with significant predictors
+    X_sig = X[significant_predictors]
+    X_sig = sm.add_constant(X_sig)
+    
+    # Fit OLS model with significant predictors
+    model = sm.OLS(y, X_sig).fit()
+    print("\nOLS Regression Results with Significant Predictors:")
+    print(model.summary())
+    
+    # Save regression summary to text file
+    with open('ols_regression_summary.txt', 'w') as f:
+        f.write(model.summary().as_text())
+    
+    return model, X_sig, y
+
+def check_assumptions(model, X, y):
+    """
+    Check for normality and heteroscedasticity. Use appropriate methods if needed.
+    """
+    if model is None:
+        print("No model to check assumptions for.")
+        return None
+    
+    print("\n=== Checking Model Assumptions ===\n")
+    
+    # Residuals
+    residuals = model.resid
+    
+    # Normality Test
+    shapiro_test = stats.shapiro(residuals)
+    print(f"Shapiro-Wilk Test: W={shapiro_test.statistic:.4f}, p-value={shapiro_test.pvalue:.4f}")
+    
+    # Heteroscedasticity Test (Breusch-Pagan)
+    _, pval, __, f_pval = sm.stats.diagnostic.het_breuschpagan(residuals, model.model.exog)
+    print(f"Breusch-Pagan Test p-value: {pval:.4f}")
+    
+    # If residuals are not normal or heteroscedasticity is present, note the issues
+    if shapiro_test.pvalue < 0.05:
+        print("\nWarning: Residuals are not normally distributed.")
+    if pval < 0.05:
+        print("Warning: Heteroscedasticity detected.")
+    
+    return model
+
+def multicollinearity_test(X):
+    """
+    Calculate Variance Inflation Factor (VIF) for each feature.
+    """
+    if X is None:
+        print("No features to test for multicollinearity.")
+        return
+    
+    print("\n=== Multicollinearity Test ===\n")
+    vif_data = pd.DataFrame()
+    vif_data['feature'] = X.columns
+    vif_data['VIF'] = [variance_inflation_factor(X.values, i) for i in range(X.shape[1])]
+    print(vif_data)
+    
+    # Save VIF data to CSV
+    vif_data.to_csv('vif_data.csv', index=False)
+
+def generate_plots(residents, model, journals):
+    """
+    Generate plots for data visualization.
+    """
+    print("\n=== Generating Plots ===\n")
+    
+    # Pie Chart: Publishing Models
+    plt.figure(figsize=(8,6))
+    journals['Publishing_Model'].value_counts().plot(kind='pie', autopct='%1.1f%%', startangle=140)
+    plt.title('Distribution of Publishing Models among Journals')
+    plt.ylabel('')
+    plt.savefig('publishing_models_pie_chart.png')
+    plt.show()
+    
+    # Scatter Plot: Impact Factor vs APC
+    plt.figure(figsize=(8,6))
+    sns.scatterplot(x='Impact_Factor', y='APC', data=journals)
+    sns.regplot(x='Impact_Factor', y='APC', data=journals, scatter=False, color='red')
+    plt.title('Journal Impact Factor vs. APC')
+    plt.xlabel('Impact Factor')
+    plt.ylabel('APC ($)')
+    plt.savefig('impact_factor_vs_apc.png')
+    plt.show()
+    
+    # Histogram: Number of Publications
+    plt.figure(figsize=(8,6))
+    sns.histplot(residents['Num_Publications'], kde=True)
+    plt.title('Distribution of Number of Publications per Resident')
+    plt.xlabel('Number of Publications')
+    plt.ylabel('Frequency')
+    plt.savefig('publications_distribution.png')
+    plt.show()
+    
+    # Histogram: Log-transformed Number of Publications
+    plt.figure(figsize=(8,6))
+    sns.histplot(np.log1p(residents['Num_Publications']), kde=True)
+    plt.title('Log-Transformed Distribution of Number of Publications per Resident')
+    plt.xlabel('Log(Number of Publications + 1)')
+    plt.ylabel('Frequency')
+    plt.savefig('log_publications_distribution.png')
+    plt.show()
+    
+    # Scatter plot: Avg_APC vs. Num_Publications
+    plt.figure(figsize=(8,6))
+    sns.scatterplot(x='Avg_APC', y='Num_Publications', data=residents)
+    sns.regplot(x='Avg_APC', y='Num_Publications', data=residents, scatter=False, color='red')
+    plt.title('Average APC vs. Number of Publications per Resident')
+    plt.xlabel('Average APC')
+    plt.ylabel('Number of Publications')
+    plt.savefig('apc_vs_publications.png')
+    plt.show()
+    
+    # Scatter plot: Avg_IF vs. Num_Publications
+    plt.figure(figsize=(8,6))
+    sns.scatterplot(x='Avg_IF', y='Num_Publications', data=residents)
+    sns.regplot(x='Avg_IF', y='Num_Publications', data=residents, scatter=False, color='red')
+    plt.title('Average Impact Factor vs. Number of Publications per Resident')
+    plt.xlabel('Average Impact Factor')
+    plt.ylabel('Number of Publications')
+    plt.savefig('if_vs_publications.png')
+    plt.show()
+    
+    if model is not None:
+        # QQ Plot of Residuals
+        plt.figure(figsize=(8,6))
+        qqplot(model.resid, line='s')
+        plt.title('Q-Q Plot of Regression Residuals')
+        plt.savefig('qq_plot_residuals.png')
+        plt.show()
+        
+        # Residuals vs Fitted Plot
+        plt.figure(figsize=(8,6))
+        sns.residplot(x=model.fittedvalues, y=model.resid, lowess=True)
+        plt.xlabel('Fitted Values')
+        plt.ylabel('Residuals')
+        plt.title('Residuals vs. Fitted')
+        plt.savefig('residuals_vs_fitted.png')
+        plt.show()
+    
+    # Heatmap of Correlation Matrix
+    plt.figure(figsize=(10,8))
+    corr_matrix = residents[['Num_Publications', 'Avg_APC', 'Avg_IF', 'Medical_School_Rank']].corr()
+    sns.heatmap(corr_matrix, annot=True, cmap='coolwarm')
+    plt.title('Correlation Matrix')
+    plt.savefig('correlation_matrix.png')
+    plt.show()
+
+# -------------------------------
+# Main Execution
+# -------------------------------
+
+def main():
+    # Load and clean data
+    data = load_and_clean_data('UroCopiamData.csv')
+    
+    # Descriptive statistics
+    journals, residents = descriptive_statistics(data)
+    
+    # Correlation analyses
+    journals = correlation_analysis(journals)
+    
+    # Regression analysis
+    model, X_sig, y = regression_analysis(residents)
+    
+    # Multicollinearity test
+    multicollinearity_test(X_sig)
+    
+    # Check assumptions
+    final_model = check_assumptions(model, X_sig, y)
+    
+    # Generate plots
+    generate_plots(residents, final_model, journals)
+
+if __name__ == "__main__":
+    main()
